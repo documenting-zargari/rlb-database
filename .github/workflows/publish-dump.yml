@@ -30,6 +30,8 @@ env:
   ARANGO_IMAGE: arangodb/arangodb:3.12.4
   ARANGO_ENDPOINT: ${{ vars.ARANGO_ENDPOINT || 'ssl://arangodb-dev.romanidb.eu:443' }}
   ASSET: rld-arangodump.tar.gz
+  USERS_ASSET: rld-users.json.enc
+  USERS_EXPORT_URL: ${{ vars.USERS_EXPORT_URL || 'https://api-beta.romanidb.eu/export/users/' }}
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -49,6 +51,18 @@ jobs:
                --server.database rms --output-directory /out/rms --overwrite true' "$ARANGO_ENDPOINT"
           sudo chown -R "$(id -u)" out
 
+      - name: Fetch the encrypted user export
+        run: |
+          # Accounts and roles, encrypted with RMS_ENCRYPT_KEY (drd-django user/export.py).
+          code=$(curl -s -D users.headers -o "$USERS_ASSET" -w '%{http_code}' "$USERS_EXPORT_URL")
+          if [ "$code" = 200 ]; then
+            tr -d '\r' < users.headers | sed -n 's/^[Xx]-[Cc]ontent-[Ff]ingerprint: //p' > users.fp
+            echo "user export: fingerprint $(cat users.fp)"
+          else
+            echo "::warning::user export not available (HTTP $code); publishing without it"
+            rm -f "$USERS_ASSET"; : > users.fp
+          fi
+
       - name: Count documents and fingerprint the data
         id: fp
         run: |
@@ -58,9 +72,9 @@ jobs:
             printf '%-20s %s\n' "${f%%_*}" "$(gzip -dc "$f" | grep -c .)" >> ../counts.txt
           done
           # Document order in a dump varies between runs, so sort before hashing.
-          fp=$(for f in $(ls *.data.json.gz *.structure.json | sort); do
+          fp=$( (for f in $(ls *.data.json.gz *.structure.json | sort); do
                  echo "== $f"; case "$f" in *.gz) gzip -dc "$f" | sort ;; *) cat "$f" ;; esac
-               done | sha256sum | cut -c1-16)
+               done; echo "== users"; cat "$GITHUB_WORKSPACE/users.fp") | sha256sum | cut -c1-16)
           echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
           cat ../counts.txt; echo "fingerprint $fp"
 
@@ -83,13 +97,18 @@ jobs:
           tag="dump-$day"
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && tag="$tag-$(date -u +%H%M)"
           tar -czf "$ASSET" -C out rms
-          sha256sum "$ASSET" > SHA256SUMS
+          assets="$ASSET"; [ -f "$USERS_ASSET" ] && assets="$assets $USERS_ASSET"
+          sha256sum $assets > SHA256SUMS
           {
             echo "ArangoDB dump of the RLD database \`rms\` (beta, the working copy), taken $(date -u '+%Y-%m-%d %H:%M') UTC."
             echo
             echo "Unpack so that \`rms/\` holds the dump files, then follow"
             echo "[deploy/RESTORE.md](https://github.com/documenting-zargari/drd-django/blob/dev/deploy/RESTORE.md)."
-            echo "Speakers' personal data is stored encrypted (\`ENC:\`); user accounts are not included."
+            if [ -f "$USERS_ASSET" ]; then
+              echo "Speakers' personal data (\`ENC:\`) and the user accounts (\`$USERS_ASSET\`) are encrypted; both need \`RMS_ENCRYPT_KEY\`."
+            else
+              echo "Speakers' personal data is stored encrypted (\`ENC:\`); user accounts are not included."
+            fi
             echo
             echo "| Collection | Documents |"
             echo "| --- | ---: |"
@@ -97,7 +116,7 @@ jobs:
             echo
             echo "Fingerprint: \`${{ steps.fp.outputs.fingerprint }}\`"
           } > notes.md
-          gh release create "$tag" "$ASSET" SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+          gh release create "$tag" $assets SHA256SUMS --repo "$GITHUB_REPOSITORY" \
             --title "Database dump $day" --notes-file notes.md --latest
           echo "tag=$tag" >> "$GITHUB_ENV"
 
