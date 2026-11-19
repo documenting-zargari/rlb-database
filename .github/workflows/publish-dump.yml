@@ -1,0 +1,123 @@
+# Publishes the RLD database as a GitHub Release whenever its data changes.
+#
+# Daily: arangodump of the beta database ("rms") through its public endpoint,
+# using the read-only user rld-reader (password in the repository secret
+# RLD_READER_PASSWORD). A content fingerprint (sorted documents) is compared
+# with the latest release; only changed data produces a new release.
+#
+# Newest dump, stable URL:
+#   https://github.com/documenting-zargari/rlb-database/releases/latest/download/rld-arangodump.tar.gz
+# Restore: https://github.com/documenting-zargari/drd-django/blob/dev/deploy/RESTORE.md
+
+name: Publish database dump
+
+on:
+  schedule:
+    - cron: "30 6 * * *"   # daily 06:30 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish even if the data has not changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency: publish-dump
+
+env:
+  ARANGO_IMAGE: arangodb/arangodb:3.12.4
+  ARANGO_ENDPOINT: ${{ vars.ARANGO_ENDPOINT || 'ssl://arangodb-dev.romanidb.eu:443' }}
+  ASSET: rld-arangodump.tar.gz
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dump the database (read-only user)
+        env:
+          RP: ${{ secrets.RLD_READER_PASSWORD }}
+        run: |
+          test -n "$RP" || { echo "::error::secret RLD_READER_PASSWORD is not set"; exit 1; }
+          mkdir -p out
+          docker run --rm -e RP -v "$PWD/out:/out" "$ARANGO_IMAGE" sh -c \
+            'arangodump --server.endpoint "$0" --server.username rld-reader --server.password "$RP" \
+               --server.database rms --output-directory /out/rms --overwrite true' "$ARANGO_ENDPOINT"
+          sudo chown -R "$(id -u)" out
+
+      - name: Count documents and fingerprint the data
+        id: fp
+        run: |
+          cd out/rms
+          : > ../counts.txt
+          for f in $(ls *.data.json.gz | sort); do
+            printf '%-20s %s\n' "${f%%_*}" "$(gzip -dc "$f" | grep -c .)" >> ../counts.txt
+          done
+          # Document order in a dump varies between runs, so sort before hashing.
+          fp=$(for f in $(ls *.data.json.gz *.structure.json | sort); do
+                 echo "== $f"; case "$f" in *.gz) gzip -dc "$f" | sort ;; *) cat "$f" ;; esac
+               done | sha256sum | cut -c1-16)
+          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
+          cat ../counts.txt; echo "fingerprint $fp"
+
+      - name: Compare with the latest release
+        id: cmp
+        run: |
+          prev=$(gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null \
+                 | sed -n 's/^Fingerprint: `\(.*\)`$/\1/p' || true)
+          echo "previous: ${prev:-none}"
+          if [ "$prev" = "${{ steps.fp.outputs.fingerprint }}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; echo "Data unchanged, nothing to publish."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        if: steps.cmp.outputs.changed == 'true'
+        run: |
+          day=$(date -u +%Y-%m-%d)
+          tag="dump-$day"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && tag="$tag-$(date -u +%H%M)"
+          tar -czf "$ASSET" -C out rms
+          sha256sum "$ASSET" > SHA256SUMS
+          {
+            echo "ArangoDB dump of the RLD database \`rms\` (beta, the working copy), taken $(date -u '+%Y-%m-%d %H:%M') UTC."
+            echo
+            echo "Unpack so that \`rms/\` holds the dump files, then follow"
+            echo "[deploy/RESTORE.md](https://github.com/documenting-zargari/drd-django/blob/dev/deploy/RESTORE.md)."
+            echo "Speakers' personal data is stored encrypted (\`ENC:\`); user accounts are not included."
+            echo
+            echo "| Collection | Documents |"
+            echo "| --- | ---: |"
+            awk '{print "| " $1 " | " $2 " |"}' out/counts.txt
+            echo
+            echo "Fingerprint: \`${{ steps.fp.outputs.fingerprint }}\`"
+          } > notes.md
+          gh release create "$tag" "$ASSET" SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+            --title "Database dump $day" --notes-file notes.md --latest
+          echo "tag=$tag" >> "$GITHUB_ENV"
+
+      - name: Record the latest dump (keeps the scheduled workflow active)
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ -n "${tag:-}" ] || [ $(( $(date +%s) - last )) -gt $(( 30 * 86400 )) ]; then
+            {
+              echo "# Latest database dump"
+              echo
+              echo "Checked: $(date -u '+%Y-%m-%d %H:%M') UTC"
+              echo
+              echo "Latest release: https://github.com/$GITHUB_REPOSITORY/releases/latest"
+              echo
+              echo '```'
+              cat out/counts.txt
+              echo '```'
+            } > LATEST.md
+            git config user.name "github-actions[bot]"
+            git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+            git add LATEST.md
+            git commit -m "Latest dump: ${tag:-unchanged} (${{ steps.fp.outputs.fingerprint }})" && git push
+          fi
