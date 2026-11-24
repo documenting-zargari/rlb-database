@@ -1,6 +1,6 @@
 # Latest database dump
 
-Checked: 2026-11-19 15:02 UTC
+Checked: 2026-11-24 18:11 UTC
 
 Latest release: https://github.com/documenting-zargari/rlb-database/releases/latest
 
